@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     zibal_merchant: SecretStr = Field(alias="ZIBAL_MERCHANT")
 
     base_url: str = Field(default="https://neshoone.smarbiz.sbs", alias="BASE_URL")
+    zibal_callback_base_url: str = Field(
+        default="https://neshoone.hamooncloud.ir",
+        alias="ZIBAL_CALLBACK_BASE_URL",
+    )
     domain: str = Field(default="neshoone.smarbiz.sbs", alias="DOMAIN")
     database_path: str = Field(default="/data/neshoone.db", alias="DATABASE_PATH")
     openai_model: str = Field(default="gpt-4.1-mini", alias="OPENAI_MODEL")
@@ -36,7 +40,7 @@ class Settings(BaseSettings):
 
     @property
     def zibal_callback_url(self) -> str:
-        return f"{self.base_url.rstrip('/')}{self.zibal_callback_path}"
+        return f"{self.zibal_callback_base_url.rstrip('/')}{self.zibal_callback_path}"
 
     @property
     def telegram_webhook_secret(self) -> str:
