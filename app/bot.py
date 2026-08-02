@@ -294,7 +294,9 @@ def build_dispatcher(
         if callback.message:
             await callback.message.answer(
                 f"مبلغ شارژ: <b>{format_toman(amount)} تومان</b>\n\n"
-                "بعد از پرداخت، موجودی کیف پول به‌صورت خودکار اضافه می‌شود.",
+                "⚠️ قبل از ورود به درگاه، فیلترشکن یا VPN را خاموش کن.\n"
+                "بعد از پرداخت، موجودی کیف پول به‌صورت خودکار اضافه می‌شود. "
+                "اگر صفحه برگشت باز نشد، چند لحظه بعد کیف پول را دوباره بررسی کن.",
                 reply_markup=keyboard,
                 parse_mode="HTML",
             )
