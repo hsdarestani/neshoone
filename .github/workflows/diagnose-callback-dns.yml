@@ -1,4 +1,4 @@
-name: Diagnose Active Callback TLS
+name: Diagnose Callback Certificate
 
 on:
   pull_request:
@@ -17,56 +17,62 @@ jobs:
       DEPLOY_USER: ${{ secrets.SSH_USER || 'root' }}
 
     steps:
-      - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y sshpass openssl dnsutils
+      - name: Install SSH helper
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Inspect production internals
+      - name: Read active TLS state
         shell: bash
         env:
           SSHPASS: ${{ secrets.PASS }}
         run: |
           set -euo pipefail
-          sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
+          output="$(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
           set +e
           cd /opt/neshoone
-          public_ip="$(curl -4 -fsS --max-time 20 https://api.ipify.org)"
-          echo "PUBLIC_IP=${public_ip}"
 
-          echo '=== Active Caddy config contains callback ==='
-          docker compose exec -T caddy wget -qO- http://127.0.0.1:2019/config/ \
-            | grep -o 'neshoone.hamooncloud.ir' | head || true
-
-          echo '=== Stored callback certificate files ==='
+          active=no
           docker compose exec -T caddy sh -c \
-            "find /data/caddy -type f | grep 'neshoone.hamooncloud.ir' | sort" || true
+            'wget -qO- http://127.0.0.1:2019/config/ | grep -q "neshoone.hamooncloud.ir"' \
+            && active=yes
 
-          echo '=== Local callback certificate ==='
-          timeout 20 openssl s_client -connect 127.0.0.1:443 \
-            -servername neshoone.hamooncloud.ir -showcerts </dev/null 2>/tmp/local-ssl.err \
-            | openssl x509 -noout -subject -issuer -dates -ext subjectAltName || true
-          cat /tmp/local-ssl.err || true
+          cert_count="$(docker compose exec -T caddy sh -c \
+            'find /data/caddy -type f 2>/dev/null | grep -c "neshoone.hamooncloud.ir"' 2>/dev/null)"
+          cert_count="${cert_count:-0}"
 
-          echo '=== Public-IP callback from the server ==='
-          curl -4vk --max-time 25 \
-            --resolve "neshoone.hamooncloud.ir:443:${public_ip}" \
-            https://neshoone.hamooncloud.ir/health || true
+          cert_subject="$(timeout 15 openssl s_client -connect 127.0.0.1:443 \
+            -servername neshoone.hamooncloud.ir -showcerts </dev/null 2>/dev/null \
+            | openssl x509 -noout -subject 2>/dev/null | head -n1)"
+          cert_subject="${cert_subject:-none}"
 
-          echo '=== NAT rules for 443 ==='
-          iptables-save 2>/dev/null | grep -E '443|DOCKER' | tail -n 100 || true
-          nft list ruleset 2>/dev/null | grep -C 3 -E 'dport 443|:443' | tail -n 120 || true
+          local_http="$(curl -fsS --resolve neshoone.hamooncloud.ir:443:127.0.0.1 \
+            --max-time 15 -o /tmp/callback-body -w '%{http_code}' \
+            https://neshoone.hamooncloud.ir/health 2>/dev/null)"
+          local_http="${local_http:-000}"
 
-          echo '=== Recent Caddy TLS logs ==='
-          docker compose logs --since=15m caddy | grep -E \
-            'hamooncloud|certificate|handshake|tls.obtain|automation' | tail -n 220 || true
+          public_ip="$(curl -4 -fsS --max-time 15 https://api.ipify.org 2>/dev/null)"
+          hairpin_http="$(curl -4 -fsS --resolve "neshoone.hamooncloud.ir:443:${public_ip}" \
+            --max-time 15 -o /tmp/hairpin-body -w '%{http_code}' \
+            https://neshoone.hamooncloud.ir/health 2>/dev/null)"
+          hairpin_http="${hairpin_http:-000}"
+
+          echo "ACTIVE=${active}"
+          echo "CERT_COUNT=${cert_count}"
+          echo "CERT_SUBJECT=${cert_subject}"
+          echo "LOCAL_HTTP=${local_http}"
+          echo "HAIRPIN_HTTP=${hairpin_http}"
+          echo 'TLS_LOGS_BEGIN'
+          docker compose logs --since=30m caddy 2>/dev/null \
+            | grep -E 'neshoone.hamooncloud.ir|tls.obtain|certificate obtained|challenge failed|authorization' \
+            | tail -n 60 || true
+          echo 'TLS_LOGS_END'
           REMOTE
+          )"
+          printf '%s\n' "$output"
 
-      - name: Inspect from public runner
+      - name: Check public endpoint
         run: |
           set +e
-          echo '=== DNS ==='
-          dig +short @1.1.1.1 A neshoone.hamooncloud.ir
-          echo '=== OpenSSL ==='
-          timeout 25 openssl s_client -connect neshoone.hamooncloud.ir:443 \
-            -servername neshoone.hamooncloud.ir -showcerts </dev/null
-          echo '=== Curl ==='
-          curl -4vk --max-time 25 https://neshoone.hamooncloud.ir/health
+          http="$(curl -4ksS --max-time 20 -o /tmp/public-body -w '%{http_code}' \
+            https://neshoone.hamooncloud.ir/health)"
+          echo "PUBLIC_HTTP=${http:-000}"
+          cat /tmp/public-body 2>/dev/null || true
