@@ -75,6 +75,19 @@ def wallet_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def payment_error_for_user(exc: ZibalError) -> str:
+    if exc.result == 106:
+        return (
+            "دامنه این ربات هنوز برای درگاه زیبال تأیید نشده است. "
+            "دامنه neshoone.smarbiz.sbs باید در تنظیمات همان درگاه ثبت شود."
+        )
+    if exc.result == 115:
+        return "IP سرور در تنظیمات درگاه زیبال ثبت نشده است."
+    if exc.result is not None:
+        return f"زیبال درخواست را رد کرد؛ کد خطا: {exc.result}"
+    return "ارتباط با زیبال برقرار نشد. کمی بعد دوباره امتحان کن."
+
+
 async def ensure_user(db: Database, message_or_callback: Message | CallbackQuery) -> int:
     user = message_or_callback.from_user
     if user is None:
@@ -239,7 +252,7 @@ def build_dispatcher(
         except ZibalError as exc:
             await db.mark_payment_failed(payment["id"], exc.result)
             logger.exception("Could not create Zibal payment")
-            await callback.answer("ساخت لینک پرداخت انجام نشد. دوباره امتحان کن.", show_alert=True)
+            await callback.answer(payment_error_for_user(exc), show_alert=True)
             return
 
         keyboard = InlineKeyboardMarkup(
