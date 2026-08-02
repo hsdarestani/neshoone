@@ -1,4 +1,4 @@
-name: Repair Callback TLS
+name: Diagnose Active Callback TLS
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  repair:
+  diagnose:
     runs-on: ubuntu-latest
     env:
       DEPLOY_HOST: ${{ secrets.HOST }}
@@ -17,48 +17,56 @@ jobs:
       DEPLOY_USER: ${{ secrets.SSH_USER || 'root' }}
 
     steps:
-      - name: Install SSH helper
-        run: sudo apt-get update && sudo apt-get install -y sshpass
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y sshpass openssl dnsutils
 
-      - name: Reload production Caddy config
+      - name: Inspect production internals
         shell: bash
         env:
           SSHPASS: ${{ secrets.PASS }}
         run: |
           set -euo pipefail
           sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
-          set -euo pipefail
+          set +e
           cd /opt/neshoone
+          public_ip="$(curl -4 -fsS --max-time 20 https://api.ipify.org)"
+          echo "PUBLIC_IP=${public_ip}"
 
-          docker compose exec -T caddy \
-            caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+          echo '=== Active Caddy config contains callback ==='
+          docker compose exec -T caddy wget -qO- http://127.0.0.1:2019/config/ \
+            | grep -o 'neshoone.hamooncloud.ir' | head || true
 
-          ready=0
-          for _ in $(seq 1 36); do
-            if curl -fsS --resolve neshoone.hamooncloud.ir:443:127.0.0.1 \
-              https://neshoone.hamooncloud.ir/health > /tmp/callback-health 2>/tmp/callback-error; then
-              ready=1
-              break
-            fi
-            sleep 5
-          done
+          echo '=== Stored callback certificate files ==='
+          docker compose exec -T caddy sh -c \
+            "find /data/caddy -type f | grep 'neshoone.hamooncloud.ir' | sort" || true
 
-          echo '=== Callback response ==='
-          cat /tmp/callback-health 2>/dev/null || true
-          cat /tmp/callback-error 2>/dev/null || true
-          echo '=== Caddy certificate logs ==='
-          docker compose logs --tail=220 caddy
+          echo '=== Local callback certificate ==='
+          timeout 20 openssl s_client -connect 127.0.0.1:443 \
+            -servername neshoone.hamooncloud.ir -showcerts </dev/null 2>/tmp/local-ssl.err \
+            | openssl x509 -noout -subject -issuer -dates -ext subjectAltName || true
+          cat /tmp/local-ssl.err || true
 
-          if [ "$ready" -ne 1 ]; then
-            exit 1
-          fi
-          grep -q '"status":"ok"' /tmp/callback-health
+          echo '=== Public-IP callback from the server ==='
+          curl -4vk --max-time 25 \
+            --resolve "neshoone.hamooncloud.ir:443:${public_ip}" \
+            https://neshoone.hamooncloud.ir/health || true
+
+          echo '=== NAT rules for 443 ==='
+          iptables-save 2>/dev/null | grep -E '443|DOCKER' | tail -n 100 || true
+          nft list ruleset 2>/dev/null | grep -C 3 -E 'dport 443|:443' | tail -n 120 || true
+
+          echo '=== Recent Caddy TLS logs ==='
+          docker compose logs --since=15m caddy | grep -E \
+            'hamooncloud|certificate|handshake|tls.obtain|automation' | tail -n 220 || true
           REMOTE
 
-      - name: Verify callback publicly
+      - name: Inspect from public runner
         run: |
-          set -euo pipefail
-          response="$(curl -fsS --retry 24 --retry-all-errors --retry-delay 5 \
-            https://neshoone.hamooncloud.ir/health)"
-          echo "$response"
-          echo "$response" | grep -q '"status":"ok"'
+          set +e
+          echo '=== DNS ==='
+          dig +short @1.1.1.1 A neshoone.hamooncloud.ir
+          echo '=== OpenSSL ==='
+          timeout 25 openssl s_client -connect neshoone.hamooncloud.ir:443 \
+            -servername neshoone.hamooncloud.ir -showcerts </dev/null
+          echo '=== Curl ==='
+          curl -4vk --max-time 25 https://neshoone.hamooncloud.ir/health
