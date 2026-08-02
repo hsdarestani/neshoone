@@ -1,0 +1,34 @@
+name: Diagnose Callback DNS
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/diagnose-callback-dns.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install DNS tools
+        run: sudo apt-get update && sudo apt-get install -y dnsutils
+
+      - name: Inspect public DNS and TLS routes
+        run: |
+          set -x
+          echo '=== system resolver ==='
+          getent ahosts neshoone.hamooncloud.ir || true
+          echo '=== Cloudflare DNS ==='
+          dig +short @1.1.1.1 A neshoone.hamooncloud.ir || true
+          dig +short @1.1.1.1 AAAA neshoone.hamooncloud.ir || true
+          echo '=== Google DNS ==='
+          dig +short @8.8.8.8 A neshoone.hamooncloud.ir || true
+          dig +short @8.8.8.8 AAAA neshoone.hamooncloud.ir || true
+          echo '=== authoritative trace ==='
+          dig +trace neshoone.hamooncloud.ir A || true
+          echo '=== curl IPv4 ==='
+          curl -4vkI --max-time 20 https://neshoone.hamooncloud.ir/health || true
+          echo '=== curl IPv6 ==='
+          curl -6vkI --max-time 20 https://neshoone.hamooncloud.ir/health || true
