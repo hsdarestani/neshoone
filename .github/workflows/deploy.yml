@@ -104,12 +104,9 @@ jobs:
           cd /opt/neshoone
           docker compose up -d --build --remove-orphans
 
-          # Compose does not recreate Caddy when only the mounted Caddyfile changes.
-          # Reload it explicitly so new domains and TLS certificates are activated.
-          if ! docker compose exec -T caddy \
-            caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
-            docker compose restart caddy
-          fi
+          # Deployment replaces Caddyfile on disk. A running file bind mount can
+          # retain the old inode, so recreate Caddy to remount the current file.
+          docker compose up -d --force-recreate --no-deps caddy
 
           healthy=0
           for _ in $(seq 1 30); do
@@ -125,8 +122,22 @@ jobs:
             exit 1
           fi
 
+          callback_configured=0
+          for _ in $(seq 1 20); do
+            if docker compose exec -T caddy sh -c \
+              'wget -qO- http://127.0.0.1:2019/config/ | grep -q "neshoone.hamooncloud.ir"'; then
+              callback_configured=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$callback_configured" -ne 1 ]; then
+            docker compose logs --tail=220 caddy
+            exit 1
+          fi
+
           callback_ready=0
-          for _ in $(seq 1 36); do
+          for _ in $(seq 1 48); do
             if curl -fsS --resolve neshoone.hamooncloud.ir:443:127.0.0.1 \
               https://neshoone.hamooncloud.ir/health >/tmp/callback-health 2>/tmp/callback-error; then
               callback_ready=1
@@ -136,7 +147,7 @@ jobs:
           done
           if [ "$callback_ready" -ne 1 ]; then
             cat /tmp/callback-error 2>/dev/null || true
-            docker compose logs --tail=220 caddy
+            docker compose logs --tail=240 caddy
             exit 1
           fi
           grep -q '"status":"ok"' /tmp/callback-health
