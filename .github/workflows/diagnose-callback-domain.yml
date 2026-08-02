@@ -1,0 +1,61 @@
+name: Diagnose Callback Domain
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-callback-domain.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      DEPLOY_HOST: ${{ secrets.HOST }}
+      DEPLOY_PASS: ${{ secrets.PASS }}
+      DEPLOY_USER: ${{ secrets.SSH_USER || 'root' }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install SSH helper
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Diagnose from production server
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          output="$(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
+          set +e
+          dns_ip="$(getent ahostsv4 neshoone.hamooncloud.ir | awk 'NR==1{print $1}')"
+          [ -n "$dns_ip" ] || dns_ip="none"
+          http_code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 25 https://neshoone.hamooncloud.ir/health 2>/dev/null)"
+          [ -n "$http_code" ] || http_code="000"
+          cd /opt/neshoone 2>/dev/null || true
+          caddy_state="$(docker compose ps --format json caddy 2>/dev/null | head -n1 | python3 -c 'import sys,json; s=sys.stdin.read().strip(); print(json.loads(s).get("State","none") if s else "none")' 2>/dev/null)"
+          [ -n "$caddy_state" ] || caddy_state="none"
+          cert_log="$(docker compose logs --tail=120 caddy 2>/dev/null | grep -Ei 'certificate|acme|challenge|error' | tail -n1 | sed -E 's/[^a-zA-Z0-9._:-]+/-/g' | cut -c1-35)"
+          [ -n "$cert_log" ] || cert_log="none"
+          printf 'DNS=%s\nHTTP=%s\nCADDY=%s\nCERT=%s\n' "$dns_ip" "$http_code" "$caddy_state" "$cert_log"
+          REMOTE
+          )"
+
+          dns_ip="$(printf '%s\n' "$output" | sed -n 's/^DNS=//p' | tail -n1)"
+          http_code="$(printf '%s\n' "$output" | sed -n 's/^HTTP=//p' | tail -n1)"
+          caddy_state="$(printf '%s\n' "$output" | sed -n 's/^CADDY=//p' | tail -n1)"
+          cert_log="$(printf '%s\n' "$output" | sed -n 's/^CERT=//p' | tail -n1)"
+          context="callback/dns-${dns_ip}/https-${http_code}/caddy-${caddy_state}"
+          context="${context:0:100}"
+          description="cert-${cert_log}"
+          description="${description:0:140}"
+          payload="$(jq -n --arg context "$context" --arg description "$description" '{state:"success",context:$context,description:$description}')"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -d "$payload" >/dev/null
