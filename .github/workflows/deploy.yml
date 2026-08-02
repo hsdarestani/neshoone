@@ -50,37 +50,6 @@ jobs:
             fi
           done
 
-      - name: Diagnose Zibal request endpoints
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ZIBAL_MERCHANT: ${{ secrets.ZIBALMERCHANT }}
-        run: |
-          set -euo pipefail
-          payload="$(jq -n \
-            --arg merchant "$ZIBAL_MERCHANT" \
-            --arg callbackUrl "https://neshoone.smarbiz.sbs/payments/zibal/callback" \
-            --arg orderId "diag-${GITHUB_RUN_ID}" \
-            '{merchant:$merchant,amount:500000,callbackUrl:$callbackUrl,orderId:$orderId,description:"Neshoone diagnostic"}')"
-
-          for item in "v1:https://gateway.zibal.ir/v1/request" "root:https://gateway.zibal.ir/request"; do
-            name="${item%%:*}"
-            url="${item#*:}"
-            output="$(curl -sS --connect-timeout 15 --max-time 30 -w '\n%{http_code}' -H 'Content-Type: application/json' -d "$payload" "$url" || true)"
-            http_code="$(printf '%s\n' "$output" | tail -n1)"
-            body="$(printf '%s\n' "$output" | sed '$d')"
-            result="$(printf '%s' "$body" | jq -r '.result // "none"' 2>/dev/null || printf 'none')"
-            context="zibal/${name}/http-${http_code}/result-${result}"
-            context="${context:0:100}"
-            status_payload="$(jq -n --arg context "$context" '{state:"success",context:$context,description:"Zibal diagnostic result code"}')"
-            curl -fsS -X POST \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
-              -d "$status_payload" >/dev/null
-          done
-
       - name: Prepare deployment bundle
         shell: bash
         env:
