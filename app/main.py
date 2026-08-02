@@ -10,6 +10,7 @@ from aiogram.types import Update
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.admin import AdminService
 from app.bot import build_dispatcher, main_keyboard
 from app.config import get_settings
 from app.db import Database
@@ -28,7 +29,8 @@ db = Database(settings.database_path)
 bot = Bot(settings.bot_token.get_secret_value())
 vision = VisionFortuneService(settings)
 zibal = ZibalService(settings)
-dp = build_dispatcher(db, vision, zibal, settings)
+admin = AdminService(settings.database_path, settings)
+dp = build_dispatcher(db, vision, zibal, settings, admin)
 
 
 def page(title: str, message: str, success: bool = True) -> str:
@@ -54,6 +56,7 @@ def page(title: str, message: str, success: bool = True) -> str:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await db.init()
+    await admin.init()
     try:
         await bot.set_webhook(
             url=settings.telegram_webhook_url,
@@ -68,7 +71,8 @@ async def lifespan(_: FastAPI):
     await bot.session.close()
 
 
-app = FastAPI(title="Neshoone", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Neshoone", version="1.1.0", lifespan=lifespan)
+admin.register_routes(app, bot)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -88,7 +92,7 @@ async def health() -> dict[str, str]:
 async def privacy() -> str:
     return page(
         "حریم خصوصی",
-        "تصویر فقط برای تولید نتیجه پردازش می‌شود. نتیجه‌ها جنبه سرگرمی و خودشناسی نمادین دارند و مبنای تصمیم پزشکی، حقوقی یا مالی نیستند.",
+        "عکس و نتیجه برای پردازش، پشتیبانی و کنترل کیفیت در پنل مدیریت ثبت می‌شوند. فایل تصویر روی فضای سرور ذخیره نمی‌شود و هنگام نیاز از زیرساخت تلگرام دریافت می‌شود. تعبیرها صرفاً سرگرمی و خودشناسی نمادین هستند.",
     )
 
 
