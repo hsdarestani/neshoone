@@ -1,0 +1,124 @@
+name: Reconcile Zibal Payments
+
+on:
+  push:
+    branches:
+      - agent/reconcile-zibal-payments
+    paths:
+      - '.github/workflows/reconcile-zibal.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.HOST }}
+      DEPLOY_PASS: ${{ secrets.PASS }}
+      DEPLOY_USER: ${{ secrets.SSH_USER || 'root' }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install SSH helper
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Verify and credit pending payments
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          output="$(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/neshoone
+          docker compose exec -T app python - <<'PY'
+          import asyncio
+          import aiosqlite
+          from aiogram import Bot
+
+          from app.bot import main_keyboard
+          from app.config import get_settings
+          from app.db import Database
+          from app.fortune import format_toman
+          from app.services.zibal import ZibalError, ZibalService
+
+
+          async def run() -> None:
+              settings = get_settings()
+              database = Database(settings.database_path)
+              zibal = ZibalService(settings)
+              bot = Bot(settings.bot_token.get_secret_value())
+              credited = 0
+              unresolved = 0
+              try:
+                  async with aiosqlite.connect(settings.database_path) as connection:
+                      connection.row_factory = aiosqlite.Row
+                      rows = await (
+                          await connection.execute(
+                              """
+                              SELECT * FROM payments
+                              WHERE status='pending' AND track_id IS NOT NULL
+                              ORDER BY created_at ASC
+                              """
+                          )
+                      ).fetchall()
+
+                  for row in rows:
+                      payment = dict(row)
+                      try:
+                          verified = await zibal.verify_payment(str(payment['track_id']))
+                      except ZibalError:
+                          unresolved += 1
+                          continue
+
+                      credit = await database.credit_verified_payment(
+                          payment_id=payment['id'],
+                          verified_amount_rial=verified['amount_rial'],
+                          zibal_result=verified['result'],
+                          ref_number=verified['ref_number'],
+                          card_number=verified['card_number'],
+                      )
+                      if not credit.get('ok') or credit.get('duplicate'):
+                          continue
+
+                      credited += 1
+                      try:
+                          await bot.send_message(
+                              chat_id=credit['user_id'],
+                              text=(
+                                  "✅ <b>کیف پولت شارژ شد</b>\n\n"
+                                  f"مبلغ: <b>{format_toman(credit['amount_toman'])} تومان</b>\n"
+                                  f"موجودی جدید: <b>{format_toman(credit['balance'])} تومان</b>\n\n"
+                                  "صفحه بازگشت درگاه خطا داشت، اما پرداخت از زیبال استعلام و ثبت شد."
+                              ),
+                              parse_mode='HTML',
+                              reply_markup=main_keyboard(),
+                          )
+                      except Exception:
+                          pass
+              finally:
+                  await bot.session.close()
+
+              print(f"CREDITED={credited}")
+              print(f"UNRESOLVED={unresolved}")
+
+
+          asyncio.run(run())
+          PY
+          REMOTE
+          )"
+
+          credited="$(printf '%s\n' "$output" | sed -n 's/^CREDITED=//p' | tail -n1)"
+          unresolved="$(printf '%s\n' "$output" | sed -n 's/^UNRESOLVED=//p' | tail -n1)"
+          credited="${credited:-0}"
+          unresolved="${unresolved:-0}"
+          context="reconcile/credited-${credited}/unresolved-${unresolved}"
+          payload="$(jq -n --arg context "$context" '{state:"success",context:$context,description:"Production Zibal reconciliation completed"}')"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -d "$payload" >/dev/null
