@@ -18,6 +18,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from app.admin import AdminService
 from app.config import Settings
 from app.db import Database
 from app.fortune import INTENTIONS, format_fortune, format_toman
@@ -77,10 +78,7 @@ def wallet_keyboard() -> InlineKeyboardMarkup:
 
 def payment_error_for_user(exc: ZibalError) -> str:
     if exc.result == 106:
-        return (
-            "دامنه این ربات هنوز برای درگاه زیبال تأیید نشده است. "
-            "دامنه neshoone.smarbiz.sbs باید در تنظیمات همان درگاه ثبت شود."
-        )
+        return "آدرس بازگشت درگاه زیبال هنوز تأیید نشده است. تنظیمات درگاه در حال بررسی است."
     if exc.result == 115:
         return "IP سرور در تنظیمات درگاه زیبال ثبت نشده است."
     if exc.result is not None:
@@ -101,6 +99,7 @@ def build_dispatcher(
     vision: VisionFortuneService,
     zibal: ZibalService,
     settings: Settings,
+    admin: AdminService,
 ) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
     router = Router()
@@ -130,9 +129,29 @@ def build_dispatcher(
             "✨ <b>به نشونه خوش اومدی</b>\n\n"
             "نیت کن، بدون برنامه‌ریزی از اولین چیزی که مقابلته عکس بگیر، "
             "تا نشانه‌های پنهان تصویرت را از نگاه انرژی، کارما و قانون جذب ببینی.\n\n"
-            "🎁 اولین فال کاملاً رایگانه. هر فال بعدی ۱۰ هزار تومان.",
+            "🎁 اولین فال کاملاً رایگانه. هر فال بعدی ۱۰ هزار تومان.\n\n"
+            "🔐 عکس و نتیجه برای کنترل کیفیت در پنل مدیریت ثبت می‌شوند؛ فایل عکس روی سرور ذخیره نمی‌شود.",
             reply_markup=main_keyboard(),
             parse_mode="HTML",
+        )
+
+    @router.message(Command("admin"))
+    async def admin_access(message: Message) -> None:
+        user_id = await ensure_user(db, message)
+        allowed, claimed = await admin.claim_or_check(user_id)
+        if not allowed:
+            await message.answer("این دستور فقط برای ادمین اصلی ربات فعال است.")
+            return
+        prefix = "✅ شما به‌عنوان اولین ادمین ثبت شدی.\n\n" if claimed else ""
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ ورود به پنل مدیریت", url=admin.panel_url(user_id))]
+            ]
+        )
+        await message.answer(
+            prefix
+            + "از دکمه زیر وارد پنل شو. لینک امضاشده است و بعد از مدتی منقضی می‌شود؛ هر زمان لازم شد دوباره /admin بزن.",
+            reply_markup=keyboard,
         )
 
     @router.message(Command("wallet"))
@@ -146,10 +165,7 @@ def build_dispatcher(
     async def choose_intention(message: Message, state: FSMContext) -> None:
         await ensure_user(db, message)
         await state.clear()
-        await message.answer(
-            "برای چه موضوعی نیت کردی؟",
-            reply_markup=intention_keyboard(),
-        )
+        await message.answer("برای چه موضوعی نیت کردی؟", reply_markup=intention_keyboard())
 
     @router.callback_query(F.data.startswith("intent:"))
     async def intention_selected(callback: CallbackQuery, state: FSMContext) -> None:
@@ -196,6 +212,16 @@ def build_dispatcher(
             )
             return
 
+        await admin.forward_photo(
+            bot=bot,
+            fortune_id=reservation["id"],
+            user=message.from_user,
+            intention=intention,
+            telegram_file_id=photo.file_id,
+            is_free=bool(reservation["is_free"]),
+            charged_amount_toman=int(reservation["charged_amount_toman"]),
+        )
+
         await state.clear()
         await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
         processing = await message.answer(
@@ -209,6 +235,7 @@ def build_dispatcher(
             result = await vision.analyze(image_buffer.getvalue(), intention)
             formatted = format_fortune(result, intention)
             await db.complete_fortune(reservation["id"], result, formatted)
+            await admin.notify_result(bot, reservation["id"], "completed", result_text=formatted)
             await processing.edit_text("✨ نشونه‌ات پیدا شد.")
             await message.answer(formatted, parse_mode="HTML", reply_markup=main_keyboard())
             balance = reservation["balance_after"]
@@ -216,6 +243,7 @@ def build_dispatcher(
             await message.answer(suffix)
         except UnusableImageError as exc:
             await db.fail_and_refund_fortune(reservation["id"], str(exc))
+            await admin.notify_result(bot, reservation["id"], "failed", error=str(exc))
             await processing.edit_text(
                 f"این عکس برای تعبیر کافی نبود: {exc}\n\n"
                 "اعتبارت برگشت. یک عکس روشن‌تر با چند شیء مشخص بفرست."
@@ -223,12 +251,14 @@ def build_dispatcher(
         except VisionError:
             logger.exception("Vision provider failed")
             await db.fail_and_refund_fortune(reservation["id"], "vision_provider_error")
+            await admin.notify_result(bot, reservation["id"], "failed", error="vision_provider_error")
             await processing.edit_text(
                 "پردازش تصویر این بار کامل نشد و اعتبارت خودکار برگشت. چند لحظه بعد دوباره امتحان کن."
             )
         except Exception:
             logger.exception("Unexpected fortune processing error")
             await db.fail_and_refund_fortune(reservation["id"], "unexpected_error")
+            await admin.notify_result(bot, reservation["id"], "failed", error="unexpected_error")
             await processing.edit_text(
                 "یک خطای موقت پیش آمد و اعتبارت خودکار برگشت. دوباره امتحان کن."
             )
@@ -294,7 +324,8 @@ def build_dispatcher(
             "۲. چند ثانیه فقط به نیتت فکر کن.\n"
             "۳. بدون صحنه‌سازی از اولین چیزی که روبه‌روته عکس بگیر.\n"
             "۴. عکس باید روشن باشد و چند شیء قابل تشخیص داشته باشد.\n\n"
-            "نتیجه بر اساس اشیای واقعی تصویر ساخته می‌شود، اما تعبیر انرژی، کارما و جذب صرفاً سرگرمی و خودشناسی نمادین است.",
+            "نتیجه بر اساس اشیای واقعی تصویر ساخته می‌شود، اما تعبیر انرژی، کارما و جذب صرفاً سرگرمی و خودشناسی نمادین است. "
+            "عکس و نتیجه برای کنترل کیفیت در پنل مدیریت ثبت می‌شوند؛ فایل عکس روی سرور ذخیره نمی‌شود.",
             parse_mode="HTML",
         )
 
