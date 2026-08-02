@@ -1,0 +1,73 @@
+name: Diagnose Zibal Production
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/diagnose-zibal.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      DEPLOY_HOST: ${{ secrets.HOST }}
+      DEPLOY_PASS: ${{ secrets.PASS }}
+      DEPLOY_USER: ${{ secrets.SSH_USER || 'root' }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install SSH client helper
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Test from production server
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          output="$(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/neshoone
+          docker compose exec -T app python - <<'PY'
+          import os
+          import httpx
+
+          merchant = os.environ["ZIBAL_MERCHANT"]
+          callback = "https://neshoone.smarbiz.sbs/payments/zibal/callback"
+          ip = httpx.get("https://api.ipify.org", timeout=20).text.strip()
+          payload = {
+              "merchant": merchant,
+              "amount": 500000,
+              "callbackUrl": callback,
+              "orderId": "production-diagnostic",
+              "description": "Neshoone production diagnostic",
+          }
+          response = httpx.post("https://gateway.zibal.ir/request", json=payload, timeout=30)
+          try:
+              data = response.json()
+          except Exception:
+              data = {}
+          print(f"IP={ip}")
+          print(f"HTTP={response.status_code}")
+          print(f"RESULT={data.get('result', 'none')}")
+          PY
+          REMOTE
+          )"
+
+          ip="$(printf '%s\n' "$output" | sed -n 's/^IP=//p' | tail -n1)"
+          http_code="$(printf '%s\n' "$output" | sed -n 's/^HTTP=//p' | tail -n1)"
+          result="$(printf '%s\n' "$output" | sed -n 's/^RESULT=//p' | tail -n1)"
+
+          context="zibal/production-ip-${ip}/http-${http_code}/result-${result}"
+          context="${context:0:100}"
+          payload="$(jq -n --arg context "$context" '{state:"success",context:$context,description:"Zibal production diagnostic"}')"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -d "$payload" >/dev/null
