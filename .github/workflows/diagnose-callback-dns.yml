@@ -1,4 +1,4 @@
-name: Diagnose Callback Certificate
+name: Repair Callback Certificate
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  diagnose:
+  repair:
     runs-on: ubuntu-latest
     env:
       DEPLOY_HOST: ${{ secrets.HOST }}
@@ -20,54 +20,59 @@ jobs:
       - name: Install SSH helper
         run: sudo apt-get update -qq && sudo apt-get install -y -qq sshpass >/dev/null
 
-      - name: Print production TLS state
+      - name: Recreate Caddy and wait for certificate
         shell: bash
         env:
           SSHPASS: ${{ secrets.PASS }}
         run: |
-          set +e
+          set -euo pipefail
           sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
-          set +e
-          cd /opt/neshoone || exit 0
-          echo 'DIAG_BEGIN'
+          set -euo pipefail
+          cd /opt/neshoone
 
-          echo -n 'ACTIVE_CALLBACK_CONFIG='
-          docker compose exec -T caddy sh -c \
-            'wget -qO- http://127.0.0.1:2019/config/ | grep -q "neshoone.hamooncloud.ir"' \
-            && echo yes || echo no
+          # The bind-mounted Caddyfile was replaced on disk by deployment while the
+          # running container still referenced the old inode. Recreate to remount it.
+          docker compose up -d --force-recreate --no-deps caddy
 
-          echo 'CERTIFICATE_FILES='
-          docker compose exec -T caddy sh -c \
-            'find /data/caddy -type f 2>/dev/null | grep "neshoone.hamooncloud.ir" | sort' || true
+          active=0
+          for _ in $(seq 1 20); do
+            if docker compose exec -T caddy sh -c \
+              'wget -qO- http://127.0.0.1:2019/config/ | grep -q "neshoone.hamooncloud.ir"'; then
+              active=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$active" -ne 1 ]; then
+            docker compose logs --tail=200 caddy
+            exit 1
+          fi
 
-          echo 'LOCAL_CERTIFICATE='
-          timeout 15 openssl s_client -connect 127.0.0.1:443 \
-            -servername neshoone.hamooncloud.ir -showcerts </dev/null 2>/dev/null \
-            | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null || true
-
-          echo 'LOCAL_HEALTH='
-          curl -fsS --resolve neshoone.hamooncloud.ir:443:127.0.0.1 \
-            --max-time 15 https://neshoone.hamooncloud.ir/health || true
-          echo
-
-          public_ip="$(curl -4 -fsS --max-time 15 https://api.ipify.org 2>/dev/null)"
-          echo 'PUBLIC_IP_HAIRPIN='
-          curl -4vk --resolve "neshoone.hamooncloud.ir:443:${public_ip}" \
-            --max-time 20 https://neshoone.hamooncloud.ir/health 2>&1 | tail -n 35 || true
-
-          echo 'CALLBACK_TLS_LOGS='
-          docker compose logs --since=45m caddy 2>/dev/null \
-            | grep -E 'neshoone.hamooncloud.ir|tls.obtain|certificate obtained|challenge failed|authorization' \
-            | tail -n 80 || true
-          echo 'DIAG_END'
+          ready=0
+          for _ in $(seq 1 48); do
+            if curl -fsS --resolve neshoone.hamooncloud.ir:443:127.0.0.1 \
+              https://neshoone.hamooncloud.ir/health >/tmp/callback-health 2>/tmp/callback-error; then
+              ready=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat /tmp/callback-error 2>/dev/null || true
+            docker compose logs --tail=240 caddy
+            exit 1
+          fi
+          grep -q '"status":"ok"' /tmp/callback-health
+          echo 'LOCAL_CALLBACK_OK'
+          docker compose logs --since=10m caddy \
+            | grep -E 'neshoone.hamooncloud.ir|certificate obtained|authorization finalized' \
+            | tail -n 40 || true
           REMOTE
 
-      - name: Print public TLS state
+      - name: Verify callback publicly
         run: |
-          set +e
-          echo 'PUBLIC_RUNNER_BEGIN'
-          timeout 20 openssl s_client -connect neshoone.hamooncloud.ir:443 \
-            -servername neshoone.hamooncloud.ir -showcerts </dev/null 2>&1 | tail -n 35
-          curl -4vk --max-time 20 https://neshoone.hamooncloud.ir/health 2>&1 | tail -n 35
-          echo 'PUBLIC_RUNNER_END'
-          exit 0
+          set -euo pipefail
+          response="$(curl -fsS --retry 24 --retry-all-errors --retry-delay 5 \
+            https://neshoone.hamooncloud.ir/health)"
+          echo "$response"
+          echo "$response" | grep -q '"status":"ok"'
