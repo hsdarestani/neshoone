@@ -64,7 +64,7 @@ class AdminService:
                 await db.commit()
                 return True, False
             count_row = await (await db.execute("SELECT COUNT(*) AS count FROM admins")).fetchone()
-            if int(count_row["count"]) == 0:
+            if count_row and int(count_row["count"]) == 0:
                 await db.execute("INSERT INTO admins(telegram_id) VALUES(?)", (telegram_id,))
                 await db.commit()
                 return True, True
@@ -145,7 +145,7 @@ class AdminService:
             f"Telegram ID: <code>{user_id}</code>\n"
             f"نیت: <b>{escape(intention)}</b>\n"
             f"نوع: <b>{payment_label}</b>\n\n"
-            "فایل روی سرور ذخیره نشده؛ این تصویر مستقیماً با file_id تلگرام ارسال شده است."
+            "فایل روی سرور ذخیره نشده؛ تصویر مستقیم با file_id تلگرام ارسال شده است."
         )
         for admin_id in await self.admin_ids():
             try:
@@ -157,7 +157,6 @@ class AdminService:
                 )
                 await self._record_notification(fortune_id, admin_id, "photo", sent.message_id)
             except Exception:
-                # Admin delivery failure must never block the user's fortune.
                 continue
 
     async def notify_result(
@@ -168,23 +167,28 @@ class AdminService:
         result_text: str | None = None,
         error: str | None = None,
     ) -> None:
-        if status == "completed":
-            body = result_text or "نتیجه بدون متن ثبت شد."
-            text = f"✅ <b>فال تکمیل شد</b>\nشناسه: <code>{escape(fortune_id)}</code>\n\n{body}"
-        else:
-            text = (
-                "❌ <b>پردازش فال ناموفق بود</b>\n"
-                f"شناسه: <code>{escape(fortune_id)}</code>\n"
-                f"خطا: <code>{escape(error or 'unknown')}</code>"
-            )
         for admin_id in await self.admin_ids():
             try:
-                chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)] or [text]
-                last_message_id: int | None = None
-                for chunk in chunks:
-                    sent = await bot.send_message(admin_id, chunk, parse_mode="HTML")
-                    last_message_id = sent.message_id
-                await self._record_notification(fortune_id, admin_id, "result", last_message_id)
+                if status == "completed":
+                    await bot.send_message(
+                        admin_id,
+                        f"✅ <b>فال تکمیل شد</b>\nشناسه: <code>{escape(fortune_id)}</code>",
+                        parse_mode="HTML",
+                    )
+                    sent = await bot.send_message(
+                        admin_id,
+                        result_text or "نتیجه بدون متن ثبت شد.",
+                        parse_mode="HTML",
+                    )
+                else:
+                    sent = await bot.send_message(
+                        admin_id,
+                        "❌ <b>پردازش فال ناموفق بود</b>\n"
+                        f"شناسه: <code>{escape(fortune_id)}</code>\n"
+                        f"خطا: <code>{escape(error or 'unknown')}</code>",
+                        parse_mode="HTML",
+                    )
+                await self._record_notification(fortune_id, admin_id, "result", sent.message_id)
             except Exception:
                 continue
 
@@ -257,10 +261,11 @@ class AdminService:
 
     @staticmethod
     def _layout(title: str, token: str, body: str) -> str:
+        safe_token = quote(token)
         nav = (
-            f'<a href="/admin?token={quote(token)}">فال‌ها</a>'
-            f'<a href="/admin/payments?token={quote(token)}">پرداخت‌ها</a>'
-            f'<a href="/admin/users?token={quote(token)}">کاربران</a>'
+            f'<a href="/admin?token={safe_token}">فال‌ها</a>'
+            f'<a href="/admin/payments?token={safe_token}">پرداخت‌ها</a>'
+            f'<a href="/admin/users?token={safe_token}">کاربران</a>'
         )
         return f"""<!doctype html><html lang="fa" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -269,9 +274,9 @@ class AdminService:
 header{{position:sticky;top:0;background:#151024ee;backdrop-filter:blur(12px);padding:16px 4%;display:flex;gap:20px;align-items:center;border-bottom:1px solid #ffffff18;z-index:5}}
 header strong{{margin-left:auto;color:#cdbaff}}header a{{color:#ddd1f5;text-decoration:none}}
 main{{width:min(1180px,94%);margin:28px auto 70px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:24px}}
-.card{{background:#171126;border:1px solid #ffffff16;border-radius:18px;padding:18px}}.metric b{{display:block;font-size:25px;color:#c4a9ff;margin-top:8px}}
+.card{{background:#171126;border:1px solid #ffffff16;border-radius:18px;padding:18px;margin-bottom:16px}}.metric b{{display:block;font-size:25px;color:#c4a9ff;margin-top:8px}}
 table{{width:100%;border-collapse:collapse;background:#171126;border-radius:18px;overflow:hidden}}th,td{{padding:13px;text-align:right;border-bottom:1px solid #ffffff10;vertical-align:top}}th{{color:#bfa7ed;background:#201735}}tr:hover td{{background:#ffffff05}}
-a{{color:#b99aff}}.badge{{display:inline-block;padding:5px 9px;border-radius:999px;background:#ffffff12;font-size:12px}}.ok{{color:#71e6a5}}.bad{{color:#ff8c9d}}
+a{{color:#b99aff}}.badge{{display:inline-block;padding:5px 9px;border-radius:999px;background:#ffffff12;font-size:12px}}
 pre{{white-space:pre-wrap;word-break:break-word;background:#0b0713;padding:15px;border-radius:12px;line-height:1.8}}img{{max-width:100%;border-radius:16px}}@media(max-width:700px){{table{{display:block;overflow:auto}}header{{flex-wrap:wrap}}}}
 </style></head><body><header><strong>نشونه — پنل مدیریت</strong>{nav}</header><main><h1>{escape(title)}</h1>{body}</main></body></html>"""
 
@@ -284,21 +289,30 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#0b0713;padding:15px;
             cards = "".join(
                 f'<div class="card metric">{label}<b>{value:,}</b></div>'
                 for label, value in [
-                    ("کاربر", stats["users"]), ("کل فال", stats["fortunes"]),
-                    ("موفق", stats["completed"]), ("ناموفق", stats["failed"]),
-                    ("فروش تومان", stats["revenue"]), ("موجودی کیف‌ها", stats["wallet_balance"]),
+                    ("کاربر", stats["users"]),
+                    ("کل فال", stats["fortunes"]),
+                    ("موفق", stats["completed"]),
+                    ("ناموفق", stats["failed"]),
+                    ("فروش تومان", stats["revenue"]),
+                    ("موجودی کیف‌ها", stats["wallet_balance"]),
                 ]
             )
-            rows = "".join(
-                "<tr>"
-                f'<td><a href="/admin/fortune/{escape(f["id"])}?token={quote(token)}">{escape(f["id"][:8])}</a></td>'
-                f'<td>{escape(f.get("first_name") or "-")}<br><small>@{escape(f.get("username") or "-")}</small></td>'
-                f'<td>{escape(f["intention"])}</td><td><span class="badge">{escape(f["status"])}</span></td>'
-                f'<td>{"رایگان" if f["is_free"] else f"{int(f["charged_amount_toman"]):,}"}</td>'
-                f'<td>{escape(f["created_at"][:19])}</td></tr>'
-                for f in fortunes
+            row_parts: list[str] = []
+            for item in fortunes:
+                price = "رایگان" if int(item["is_free"]) else f'{int(item["charged_amount_toman"]):,}'
+                row_parts.append(
+                    "<tr>"
+                    f'<td><a href="/admin/fortune/{escape(item["id"])}?token={quote(token)}">{escape(item["id"][:8])}</a></td>'
+                    f'<td>{escape(item.get("first_name") or "-")}<br><small>@{escape(item.get("username") or "-")}</small></td>'
+                    f'<td>{escape(item["intention"])}</td>'
+                    f'<td><span class="badge">{escape(item["status"])}</span></td>'
+                    f'<td>{price}</td><td>{escape(item["created_at"][:19])}</td></tr>'
+                )
+            rows = "".join(row_parts)
+            body = (
+                f'<div class="grid">{cards}</div><table><tr><th>شناسه</th><th>کاربر</th>'
+                f'<th>نیت</th><th>وضعیت</th><th>هزینه</th><th>زمان</th></tr>{rows}</table>'
             )
-            body = f'<div class="grid">{cards}</div><table><tr><th>شناسه</th><th>کاربر</th><th>نیت</th><th>وضعیت</th><th>هزینه</th><th>زمان</th></tr>{rows}</table>'
             return HTMLResponse(self._layout("آخرین فال‌ها", token, body))
 
         @app.get("/admin/fortune/{fortune_id}", response_class=HTMLResponse)
@@ -312,12 +326,13 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#0b0713;padding:15px;
                 try:
                     raw = json.dumps(json.loads(item["result_json"]), ensure_ascii=False, indent=2)
                 except Exception:
-                    raw = item["result_json"]
+                    raw = str(item["result_json"])
+            price = "رایگان" if int(item["is_free"]) else f'{int(item["charged_amount_toman"]):,} تومان'
             image_url = f'/admin/fortune/{quote(fortune_id)}/image?token={quote(token)}'
             body = f"""
 <div class="grid"><div class="card"><b>کاربر</b><p>{escape(item.get('first_name') or '-')} — @{escape(item.get('username') or '-')}</p><code>{item['user_id']}</code></div>
 <div class="card"><b>نیت</b><p>{escape(item['intention'])}</p></div><div class="card"><b>وضعیت</b><p>{escape(item['status'])}</p></div>
-<div class="card"><b>هزینه</b><p>{'رایگان' if item['is_free'] else f"{int(item['charged_amount_toman']):,} تومان"}</p></div></div>
+<div class="card"><b>هزینه</b><p>{price}</p></div></div>
 <div class="card"><h2>تصویر</h2><img src="{image_url}" loading="lazy"><p><small>تصویر هنگام مشاهده از Telegram CDN دریافت می‌شود و روی سرور ذخیره نشده است.</small></p></div>
 <div class="card"><h2>نتیجه کاربر</h2><pre>{escape(item.get('result_text') or '-')}</pre></div>
 <div class="card"><h2>خروجی خام AI</h2><pre>{escape(raw or '-')}</pre></div>
@@ -334,7 +349,11 @@ pre{{white-space:pre-wrap;word-break:break-word;background:#0b0713;padding:15px;
             buffer = io.BytesIO()
             await bot.download_file(tg_file.file_path, destination=buffer)
             buffer.seek(0)
-            return StreamingResponse(buffer, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300"})
+            return StreamingResponse(
+                buffer,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=300"},
+            )
 
         @app.get("/admin/payments", response_class=HTMLResponse)
         async def payments_page(token: str = Query("")) -> HTMLResponse:
