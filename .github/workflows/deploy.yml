@@ -102,10 +102,32 @@ jobs:
           install -m 600 /tmp/neshoone.env /opt/neshoone/.env
           cd /opt/neshoone
           docker compose up -d --build --remove-orphans
+
+          healthy=0
+          for _ in $(seq 1 30); do
+            if docker compose exec -T app python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)" >/dev/null 2>&1; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" -ne 1 ]; then
+            docker compose ps
+            docker compose logs --tail=200
+            exit 1
+          fi
+
           docker image prune -f
           docker compose ps
           rm -f /tmp/neshoone.tar.gz /tmp/neshoone.env
           REMOTE
+
+      - name: Verify production endpoint
+        run: |
+          set -euo pipefail
+          response="$(curl -fsS --retry 12 --retry-all-errors --retry-delay 5 https://neshoone.smarbiz.sbs/health)"
+          echo "$response"
+          echo "$response" | grep -q '"status":"ok"'
 
       - name: Mark deployment success
         if: success()
@@ -117,7 +139,7 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
-            -d '{"state":"success","context":"deploy/production","description":"Neshoone deployed to production"}'
+            -d '{"state":"success","context":"deploy/production","description":"Neshoone is healthy in production"}'
 
       - name: Mark deployment failure
         if: failure()
