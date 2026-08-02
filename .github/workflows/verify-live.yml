@@ -1,0 +1,81 @@
+name: Verify Live Production
+
+on:
+  push:
+    branches:
+      - agent/verify-live-production
+    paths:
+      - '.github/workflows/verify-live.yml'
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      DEPLOY_HOST: ${{ secrets.HOST }}
+      DEPLOY_PASS: ${{ secrets.PASS }}
+      DEPLOY_USER: ${{ secrets.SSH_USER || 'root' }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install SSH helper
+        run: sudo apt-get update && sudo apt-get install -y sshpass
+
+      - name: Inspect production and test Zibal
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          output="$(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          cd /opt/neshoone
+          admin_present=no
+          grep -q 'AdminService' app/main.py && admin_present=yes || true
+          local_health="$(docker compose exec -T app python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10).read().decode())" 2>/dev/null || true)"
+          zibal_result="$(docker compose exec -T app python - <<'PY'
+          import os
+          import httpx
+          payload = {
+              'merchant': os.environ['ZIBAL_MERCHANT'],
+              'amount': 500000,
+              'callbackUrl': 'https://neshoone.hamooncloud.ir/payments/zibal/callback',
+              'orderId': 'verify-live-production',
+              'description': 'Neshoone live verification',
+          }
+          response = httpx.post('https://gateway.zibal.ir/request', json=payload, timeout=30)
+          try:
+              data = response.json()
+          except Exception:
+              data = {}
+          print(data.get('result', 'none'))
+          PY
+          )"
+          printf 'ADMIN=%s\nLOCAL=%s\nZIBAL=%s\n' "$admin_present" "$local_health" "$zibal_result"
+          REMOTE
+          )"
+
+          admin_present="$(printf '%s\n' "$output" | sed -n 's/^ADMIN=//p' | tail -n1)"
+          local_health="$(printf '%s\n' "$output" | sed -n 's/^LOCAL=//p' | tail -n1)"
+          zibal_result="$(printf '%s\n' "$output" | sed -n 's/^ZIBAL=//p' | tail -n1)"
+
+          main_http="$(curl -sS -o /tmp/main.out -w '%{http_code}' --max-time 25 https://neshoone.smarbiz.sbs/health || true)"
+          callback_http="$(curl -sS -o /tmp/callback.out -w '%{http_code}' --max-time 25 https://neshoone.hamooncloud.ir/health || true)"
+
+          for context in \
+            "live/admin-${admin_present}" \
+            "live/local-health-$([ "$local_health" = '{\"status\":\"ok\"}' ] && echo ok || echo bad)" \
+            "live/main-http-${main_http}" \
+            "live/callback-http-${callback_http}" \
+            "live/zibal-result-${zibal_result}"; do
+            payload="$(jq -n --arg context "$context" '{state:"success",context:$context,description:"Neshoone live verification"}')"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+              -d "$payload" >/dev/null
+          done
