@@ -1,4 +1,4 @@
-{$DOMAIN:neshoone.smarbiz.sbs} {
+neshoone.smarbiz.sbs, neshoone.hamooncloud.ir {
     encode zstd gzip
     reverse_proxy app:8000
 
