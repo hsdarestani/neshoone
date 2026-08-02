@@ -11,24 +11,55 @@ on:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
+    env:
+      DEPLOY_HOST: ${{ secrets.HOST }}
+      DEPLOY_PASS: ${{ secrets.PASS }}
+      DEPLOY_USER: ${{ secrets.SSH_USER || 'root' }}
+
     steps:
-      - name: Install DNS tools
-        run: sudo apt-get update && sudo apt-get install -y dnsutils
+      - name: Install diagnostic tools
+        run: sudo apt-get update && sudo apt-get install -y dnsutils sshpass openssl
 
       - name: Inspect public DNS and TLS routes
         run: |
           set -x
-          echo '=== system resolver ==='
           getent ahosts neshoone.hamooncloud.ir || true
-          echo '=== Cloudflare DNS ==='
           dig +short @1.1.1.1 A neshoone.hamooncloud.ir || true
           dig +short @1.1.1.1 AAAA neshoone.hamooncloud.ir || true
-          echo '=== Google DNS ==='
           dig +short @8.8.8.8 A neshoone.hamooncloud.ir || true
           dig +short @8.8.8.8 AAAA neshoone.hamooncloud.ir || true
-          echo '=== authoritative trace ==='
-          dig +trace neshoone.hamooncloud.ir A || true
-          echo '=== curl IPv4 ==='
           curl -4vkI --max-time 20 https://neshoone.hamooncloud.ir/health || true
-          echo '=== curl IPv6 ==='
-          curl -6vkI --max-time 20 https://neshoone.hamooncloud.ir/health || true
+
+      - name: Inspect production listener and certificates
+        shell: bash
+        env:
+          SSHPASS: ${{ secrets.PASS }}
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
+          set -x
+          cd /opt/neshoone
+
+          echo '=== listeners ==='
+          ss -ltnp | grep -E ':(80|443)\b' || true
+          echo '=== docker compose ==='
+          docker compose ps
+          echo '=== published ports ==='
+          docker inspect neshoone-caddy-1 --format '{{json .NetworkSettings.Ports}}' 2>/dev/null || true
+
+          echo '=== local main TLS ==='
+          curl -vkI --resolve neshoone.smarbiz.sbs:443:127.0.0.1 --max-time 20 https://neshoone.smarbiz.sbs/health || true
+          echo '=== local callback TLS ==='
+          curl -vkI --resolve neshoone.hamooncloud.ir:443:127.0.0.1 --max-time 20 https://neshoone.hamooncloud.ir/health || true
+
+          echo '=== public-IP callback from host ==='
+          curl -vkI --resolve neshoone.hamooncloud.ir:443:${DEPLOY_HOST:-127.0.0.1} --max-time 20 https://neshoone.hamooncloud.ir/health || true
+
+          echo '=== openssl localhost callback ==='
+          timeout 20 openssl s_client -connect 127.0.0.1:443 -servername neshoone.hamooncloud.ir -brief </dev/null || true
+          echo '=== openssl public callback ==='
+          timeout 20 openssl s_client -connect "${DEPLOY_HOST}:443" -servername neshoone.hamooncloud.ir -brief </dev/null || true
+
+          echo '=== caddy logs ==='
+          docker compose logs --tail=240 caddy || true
+          REMOTE
