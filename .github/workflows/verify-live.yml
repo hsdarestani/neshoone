@@ -30,47 +30,33 @@ jobs:
           SSHPASS: ${{ secrets.PASS }}
         run: |
           set -euo pipefail
-          output="$(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}" 'bash -s' <<'REMOTE'
-          set -euo pipefail
-          cd /opt/neshoone
-          admin_present=no
-          grep -q 'AdminService' app/main.py && admin_present=yes || true
-          local_health="$(docker compose exec -T app python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10).read().decode())" 2>/dev/null || true)"
-          zibal_result="$(docker compose exec -T app python - <<'PY'
-          import os
-          import httpx
-          payload = {
-              'merchant': os.environ['ZIBAL_MERCHANT'],
-              'amount': 500000,
-              'callbackUrl': 'https://neshoone.hamooncloud.ir/payments/zibal/callback',
-              'orderId': 'verify-live-production',
-              'description': 'Neshoone live verification',
-          }
-          response = httpx.post('https://gateway.zibal.ir/request', json=payload, timeout=30)
-          try:
-              data = response.json()
-          except Exception:
-              data = {}
-          print(data.get('result', 'none'))
-          PY
-          )"
-          printf 'ADMIN=%s\nLOCAL=%s\nZIBAL=%s\n' "$admin_present" "$local_health" "$zibal_result"
-          REMOTE
-          )"
 
-          admin_present="$(printf '%s\n' "$output" | sed -n 's/^ADMIN=//p' | tail -n1)"
-          local_health="$(printf '%s\n' "$output" | sed -n 's/^LOCAL=//p' | tail -n1)"
-          zibal_result="$(printf '%s\n' "$output" | sed -n 's/^ZIBAL=//p' | tail -n1)"
+          ssh_cmd=(sshpass -e ssh -o StrictHostKeyChecking=accept-new "${DEPLOY_USER}@${DEPLOY_HOST}")
+
+          admin_present="$(${ssh_cmd[@]} "grep -q 'AdminService' /opt/neshoone/app/main.py && echo yes || echo no" | tail -n1 | tr -d '\r')"
+          local_health="$(${ssh_cmd[@]} "cd /opt/neshoone && docker compose exec -T app python -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=10).read().decode())\"" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
+          callback_dns="$(${ssh_cmd[@]} "getent ahostsv4 neshoone.hamooncloud.ir | awk 'NR==1{print \\$1}'" | tail -n1 | tr -d '\r' || true)"
+          callback_remote_http="$(${ssh_cmd[@]} "curl -sS -o /tmp/callback-health.out -w '%{http_code}' --max-time 25 https://neshoone.hamooncloud.ir/health || true" | tail -n1 | tr -d '\r')"
+
+          zibal_result="$(${ssh_cmd[@]} "cd /opt/neshoone && docker compose exec -T app python -c \"import os,httpx; p={'merchant':os.environ['ZIBAL_MERCHANT'],'amount':500000,'callbackUrl':'https://neshoone.hamooncloud.ir/payments/zibal/callback','orderId':'verify-live-production','description':'Neshoone live verification'}; r=httpx.post('https://gateway.zibal.ir/request',json=p,timeout=30); print(r.json().get('result','none'))\"" 2>/dev/null | tail -n1 | tr -d '\r' || true)"
 
           main_http="$(curl -sS -o /tmp/main.out -w '%{http_code}' --max-time 25 https://neshoone.smarbiz.sbs/health || true)"
           callback_http="$(curl -sS -o /tmp/callback.out -w '%{http_code}' --max-time 25 https://neshoone.hamooncloud.ir/health || true)"
+          local_label=bad
+          [ "$local_health" = '{"status":"ok"}' ] && local_label=ok
+          [ -n "$callback_dns" ] || callback_dns=none
+          [ -n "$zibal_result" ] || zibal_result=none
+          [ -n "$admin_present" ] || admin_present=none
 
           for context in \
             "live/admin-${admin_present}" \
-            "live/local-health-$([ "$local_health" = '{\"status\":\"ok\"}' ] && echo ok || echo bad)" \
+            "live/local-health-${local_label}" \
             "live/main-http-${main_http}" \
-            "live/callback-http-${callback_http}" \
+            "live/callback-dns-${callback_dns}" \
+            "live/callback-runner-http-${callback_http}" \
+            "live/callback-server-http-${callback_remote_http}" \
             "live/zibal-result-${zibal_result}"; do
+            context="${context:0:100}"
             payload="$(jq -n --arg context "$context" '{state:"success",context:$context,description:"Neshoone live verification"}')"
             curl -fsS -X POST \
               -H "Authorization: Bearer ${GH_TOKEN}" \
