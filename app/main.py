@@ -133,6 +133,17 @@ async def zibal_callback(request: Request) -> HTMLResponse:
     if not payment:
         return HTMLResponse(page("پرداخت پیدا نشد", "شناسه این پرداخت در سیستم وجود ندارد.", False), status_code=404)
 
+    if payment["status"] == "paid":
+        user = await db.get_user(int(payment["user_id"]))
+        balance = int(user["balance_toman"]) if user else 0
+        return HTMLResponse(
+            page(
+                "پرداخت قبلاً ثبت شده",
+                f"این تراکنش قبلاً تأیید شده است. موجودی کیف پول شما {format_toman(balance)} تومان است.",
+                True,
+            )
+        )
+
     if not track_id and payment.get("track_id"):
         track_id = str(payment["track_id"])
     if not track_id:
