@@ -6,6 +6,11 @@ on:
       - agent/fix-callback-tls
     paths:
       - '.github/workflows/apply-payment-hardening.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/apply-payment-hardening.yml'
 
 permissions:
   contents: write
@@ -23,22 +28,21 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          bot = Path('app/bot.py')
+          bot = Path("app/bot.py")
           text = bot.read_text()
-          old = '''                f"مبلغ شارژ: <b>{format_toman(amount)} تومان</b>\\n\\n"
-                          "بعد از پرداخت، موجودی کیف پول به‌صورت خودکار اضافه می‌شود.",'''
-          new = '''                f"مبلغ شارژ: <b>{format_toman(amount)} تومان</b>\\n\\n"
-                          "⚠️ قبل از ورود به درگاه، فیلترشکن یا VPN را خاموش کن.\\n"
-                          "بعد از پرداخت، موجودی کیف پول به‌صورت خودکار اضافه می‌شود. "
-                          "اگر صفحه برگشت باز نشد، ربات وضعیت پرداخت را خودش بررسی می‌کند.",'''
+          old = '                "بعد از پرداخت، موجودی کیف پول به‌صورت خودکار اضافه می‌شود.",'
+          new = (
+              '                "⚠️ قبل از ورود به درگاه، فیلترشکن یا VPN را خاموش کن.\\n"\n'
+              '                "بعد از پرداخت، موجودی کیف پول به‌صورت خودکار اضافه می‌شود. "\n'
+              '                "اگر صفحه برگشت باز نشد، ربات وضعیت پرداخت را خودش بررسی می‌کند.",'
+          )
           if old not in text:
-              raise SystemExit('bot payment message marker not found')
+              raise SystemExit("bot payment message marker not found")
           bot.write_text(text.replace(old, new, 1))
 
-          db = Path('app/db.py')
+          db = Path("app/db.py")
           text = db.read_text()
-          marker = '''    async def credit_verified_payment(
-          '''
+          marker = "    async def credit_verified_payment(\n"
           method = '''    async def pending_payments(self, limit: int = 100) -> list[dict[str, Any]]:
               async with aiosqlite.connect(self.path) as db:
                   db.row_factory = aiosqlite.Row
@@ -56,37 +60,22 @@ jobs:
 
 '''
           if marker not in text:
-              raise SystemExit('db credit marker not found')
+              raise SystemExit("db payment marker not found")
           db.write_text(text.replace(marker, method + marker, 1))
 
-          main = Path('app/main.py')
+          main = Path("app/main.py")
           text = main.read_text()
-          text = text.replace('import logging\nfrom contextlib import asynccontextmanager',
-                              'import asyncio\nimport logging\nfrom contextlib import asynccontextmanager, suppress', 1)
+          import_marker = "import logging\nfrom contextlib import asynccontextmanager"
+          if import_marker not in text:
+              raise SystemExit("main import marker not found")
+          text = text.replace(
+              import_marker,
+              "import asyncio\nimport logging\nfrom contextlib import asynccontextmanager, suppress",
+              1,
+          )
 
-          lifecycle_marker = '''@asynccontextmanager
-          async def lifespan(_: FastAPI):
-          '''
-          helpers = '''async def notify_payment_credit(credit: dict[str, Any]) -> None:
-              if credit.get("duplicate") or not credit.get("ok"):
-                  return
-              try:
-                  await bot.send_message(
-                      chat_id=credit["user_id"],
-                      text=(
-                          "✅ <b>کیف پولت شارژ شد</b>\\n\\n"
-                          f"مبلغ: <b>{format_toman(credit['amount_toman'])} تومان</b>\\n"
-                          f"موجودی جدید: <b>{format_toman(credit['balance'])} تومان</b>\\n\\n"
-                          "حالا می‌تونی نشونه جدیدت رو بگیری."
-                      ),
-                      parse_mode="HTML",
-                      reply_markup=main_keyboard(),
-                  )
-              except Exception:
-                  logger.exception("Payment succeeded but Telegram notification failed")
-
-
-          async def reconcile_pending_payments_once() -> None:
+          lifecycle_marker = "@asynccontextmanager\nasync def lifespan(_: FastAPI):\n"
+          helpers = '''async def reconcile_pending_payments_once() -> None:
               for payment in await db.pending_payments():
                   try:
                       verified = await zibal.verify_payment(str(payment["track_id"]))
@@ -99,9 +88,23 @@ jobs:
                       ref_number=verified["ref_number"],
                       card_number=verified["card_number"],
                   )
-                  if credit.get("ok") and not credit.get("duplicate"):
-                      logger.info("Reconciled Zibal payment %s", payment["id"])
-                      await notify_payment_credit(credit)
+                  if not credit.get("ok") or credit.get("duplicate"):
+                      continue
+                  logger.info("Reconciled Zibal payment %s", payment["id"])
+                  try:
+                      await bot.send_message(
+                          chat_id=credit["user_id"],
+                          text=(
+                              "✅ <b>کیف پولت شارژ شد</b>\\n\\n"
+                              f"مبلغ: <b>{format_toman(credit['amount_toman'])} تومان</b>\\n"
+                              f"موجودی جدید: <b>{format_toman(credit['balance'])} تومان</b>\\n\\n"
+                              "صفحه برگشت درگاه باز نشد، اما پرداخت از زیبال استعلام و با موفقیت ثبت شد."
+                          ),
+                          parse_mode="HTML",
+                          reply_markup=main_keyboard(),
+                      )
+                  except Exception:
+                      logger.exception("Reconciled payment notification failed")
 
 
           async def payment_reconciliation_loop() -> None:
@@ -117,13 +120,11 @@ jobs:
 
 '''
           if lifecycle_marker not in text:
-              raise SystemExit('lifespan marker not found')
+              raise SystemExit("main lifespan marker not found")
           text = text.replace(lifecycle_marker, helpers + lifecycle_marker, 1)
 
-          old_lifespan_tail = '''    yield
-              await bot.session.close()
-          '''
-          new_lifespan_tail = '''    reconciliation_task = asyncio.create_task(payment_reconciliation_loop())
+          tail = "    yield\n    await bot.session.close()\n"
+          replacement = '''    reconciliation_task = asyncio.create_task(payment_reconciliation_loop())
               try:
                   yield
               finally:
@@ -132,31 +133,9 @@ jobs:
                       await reconciliation_task
                   await bot.session.close()
           '''
-          if old_lifespan_tail not in text:
-              raise SystemExit('lifespan tail marker not found')
-          text = text.replace(old_lifespan_tail, new_lifespan_tail, 1)
-
-          old_notify = '''    if not credit.get("duplicate"):
-                  try:
-                      await bot.send_message(
-                          chat_id=credit["user_id"],
-                          text=(
-                              "✅ <b>کیف پولت شارژ شد</b>\\n\\n"
-                              f"مبلغ: <b>{format_toman(credit['amount_toman'])} تومان</b>\\n"
-                              f"موجودی جدید: <b>{format_toman(credit['balance'])} تومان</b>\\n\\n"
-                              "حالا می‌تونی نشونه جدیدت رو بگیری."
-                          ),
-                          parse_mode="HTML",
-                          reply_markup=main_keyboard(),
-                      )
-                  except Exception:
-                      logger.exception("Payment succeeded but Telegram notification failed")
-          '''
-          new_notify = '''    await notify_payment_credit(credit)
-          '''
-          if old_notify not in text:
-              raise SystemExit('callback notification marker not found')
-          main.write_text(text.replace(old_notify, new_notify, 1))
+          if tail not in text:
+              raise SystemExit("main lifespan tail not found")
+          main.write_text(text.replace(tail, replacement, 1))
           PY
 
       - name: Commit patch
